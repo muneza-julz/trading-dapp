@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Blockchain Demo - Proof of Work</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="top">
+  <h1>Blockchain Demo - Proof of Work</h1>
+  <p>Mine blocks, then edit or attack one and watch the chain break. Same logic as the Java project.</p>
+</div>
+
+<div class="controls">
+  <input id="data" placeholder="Block data, e.g. Alice pays Bob 10">
+  <button id="mine" class="primary">Mine Block</button>
+  <label style="margin:0">Difficulty
+    <select id="diff"><option>1</option><option>2</option><option selected>3</option><option>4</option><option>5</option></select>
+  </label>
+  <button id="validate">Validate Chain</button>
+  <button id="reset">New Chain</button>
+</div>
+
+<p id="state"></p>
+<div id="live"></div>
+<div id="chainwrap"><div id="chain"></div></div>
+<pre id="log"></pre>
+
+<script>
+// ---------- SHA-256 (synchronous, so mining is fast) ----------
+const sha256 = (() => {
+  const P = []; for (let n = 2; P.length < 64; n++) if (P.every(p => n % p)) P.push(n);
+  const K = P.map(p => (Math.cbrt(p) % 1) * 4294967296 >>> 0);
+  const H0 = P.slice(0, 8).map(p => (Math.sqrt(p) % 1) * 4294967296 >>> 0);
+  const rr = (x, n) => (x >>> n) | (x << (32 - n));
+  return s => {
+    const bytes = new TextEncoder().encode(s), l = bytes.length, n = ((l + 9 + 63) >> 6) << 6;
+    const m = new Uint8Array(n); m.set(bytes); m[l] = 0x80;
+    const dv = new DataView(m.buffer);
+    dv.setUint32(n - 4, (l * 8) >>> 0); dv.setUint32(n - 8, Math.floor(l * 8 / 4294967296));
+    const h = H0.slice(), w = new Uint32Array(64);
+    for (let o = 0; o < n; o += 64) {
+      for (let i = 0; i < 16; i++) w[i] = dv.getUint32(o + i * 4);
+      for (let i = 16; i < 64; i++) {
+        const x = w[i - 15], y = w[i - 2];
+        w[i] = (w[i - 16] + (rr(x, 7) ^ rr(x, 18) ^ (x >>> 3)) + w[i - 7] + (rr(y, 17) ^ rr(y, 19) ^ (y >>> 10))) >>> 0;
+      }
+      let [a, b, c, d, e, f, g, hh] = h;
+      for (let i = 0; i < 64; i++) {
+        const t1 = (hh + (rr(e, 6) ^ rr(e, 11) ^ rr(e, 25)) + ((e & f) ^ (~e & g)) + K[i] + w[i]) >>> 0;
+        const t2 = ((rr(a, 2) ^ rr(a, 13) ^ rr(a, 22)) + ((a & b) ^ (a & c) ^ (b & c))) >>> 0;
+        hh = g; g = f; f = e; e = (d + t1) >>> 0; d = c; c = b; b = a; a = (t1 + t2) >>> 0;
+      }
+      [a, b, c, d, e, f, g, hh].forEach((v, i) => h[i] = (h[i] + v) >>> 0);
+    }
+    return h.map(x => x.toString(16).padStart(8, '0')).join('');
+  };
+})();
+
+// ---------- Blockchain model ----------
+const $ = q => document.querySelector(q);
+const esc = s => s.replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+const now = () => new Date().toISOString().slice(0, 19).replace('T', ' ');
+let chain = [], ghost = null, busy = false;
+
+const hashOf = b => sha256(b.index + b.timestamp + b.data + b.prev + b.nonce + b.difficulty);
+
+function newBlock(data) {
+  const p = chain[chain.length - 1];
+  return { index: chain.length, timestamp: now(), data, prev: p ? p.hash : '0', nonce: 0, difficulty: 0, hash: '' };
+}
+
+// Proof of Work: change the nonce until the hash starts with N zeros.
+// Works in small batches so the page never freezes.
+async function mine(b, d, tick) {
+  const target = '0'.repeat(d), t0 = performance.now();
+  b.difficulty = d; b.nonce = 0; b.hash = hashOf(b);
+  while (!b.hash.startsWith(target)) {
+    for (let i = 0; i < 2000 && !b.hash.startsWith(target); i++) { b.nonce++; b.hash = hashOf(b); }
+    if (tick) tick(b);
+    await new Promise(r => setTimeout(r));
+  }
+  b.ms = Math.round(performance.now() - t0);
+}
+
+// Returns null if block i is fine, otherwise the reason it is not.
+function problem(i) {
+  const b = chain[i];
+  if (b.hash !== hashOf(b)) return 'stored hash does not match the block contents (data was altered).';
+  if (!b.hash.startsWith('0'.repeat(b.difficulty))) return `hash lacks ${b.difficulty} leading zeros - Proof of Work is missing.`;
+  if (i && b.prev !== chain[i - 1].hash) return `previous-hash link does not match block #${i - 1}'s hash.`;
+  return null;
+}
+
+// ---------- Drawing ----------
+const hv = h => { const s = h.slice(0, 24) + (h.length > 24 ? '…' : ''), z = s.match(/^0*/)[0].length; return `<b>${s.slice(0, z)}</b>${s.slice(z)}`; };
+
+function card(b, i, g) {
+  return `<article class="card" id="${g ? 'ghost' : 'c' + i}" data-i="${i}">
+    <header>BLOCK #${i}${i ? '' : ' <small>GENESIS</small>'}${g ? ' <small>mining...</small>' : ''}</header>
+    <div class="body">
+      <label>Timestamp</label><code>${b.timestamp}</code>
+      <label>Data ${g ? '' : '(editable - try it!)'}</label><textarea rows="2" ${g ? 'disabled' : ''}>${esc(b.data)}</textarea>
+      <label>Nonce · difficulty</label><code class="nonce"></code>
+      <label>Previous hash</label><code class="prev"></code>
+      <label>Hash</label><code class="hash"></code>
+      ${g ? '' : `<p class="status"></p><p class="why"></p>
+      <div class="acts">
+        <button data-a="remine">Re-mine from here</button>
+        <button data-a="rehash">Recompute hash (no mining)</button>
+        <button data-a="fake">Fake hash</button>
+        <button data-a="link">Break link</button>
+      </div>`}
+    </div></article>`;
+}
+
+function fill(c, b) {
+  c.querySelector('.nonce').textContent = b.nonce.toLocaleString() + ' · ' + b.difficulty;
+  c.querySelector('.prev').innerHTML = hv(b.prev);
+  c.querySelector('.hash').innerHTML = hv(b.hash);
+}
+
+function render() {
+  const w = $('#chain'); w.innerHTML = '';
+  chain.forEach((b, i) => {
+    if (i) w.insertAdjacentHTML('beforeend', `<div class="link" data-l="${i}"><span></span></div>`);
+    w.insertAdjacentHTML('beforeend', card(b, i));
+  });
+  if (ghost) {
+    if (chain.length) w.insertAdjacentHTML('beforeend', '<div class="link mining"><span>mining</span></div>');
+    w.insertAdjacentHTML('beforeend', card(ghost, ghost.index, true));
+  }
+  paint();
+  if (busy) lock(true);
+}
+
+// Refresh colours, statuses and hashes without rebuilding the cards.
+function paint() {
+  let bad = -1;
+  chain.forEach((b, i) => {
+    const c = $('#c' + i), p = problem(i);
+    fill(c, b);
+    c.classList.toggle('ok', !p); c.classList.toggle('bad', !!p);
+    c.querySelector('.status').textContent = p ? 'INVALID' : 'VALID';
+    c.querySelector('.why').textContent = p || '';
+    if (p && bad < 0) bad = i;
+    if (i) {
+      const l = document.querySelector(`[data-l="${i}"]`), ok = b.prev === chain[i - 1].hash;
+      l.classList.toggle('bad', !ok); l.firstChild.textContent = ok ? 'linked' : 'BROKEN';
+    }
+  });
+  if (ghost) fill($('#ghost'), ghost);
+  const s = $('#state');
+  s.className = bad < 0 ? 'good' : 'fail';
+  s.textContent = bad < 0 ? 'Chain status: VALID - all checks passed.' : `Chain status: INVALID at block #${bad} - ${problem(bad)}`;
+}
+
+function lock(v) {
+  busy = v;
+  document.querySelectorAll('button,select,#data').forEach(e => e.disabled = v);
+}
+
+function log(msg) { const l = $('#log'); l.textContent += msg + '\n'; l.scrollTop = l.scrollHeight; }
+const scrollEnd = () => { const c = $('#chainwrap'); c.scrollLeft = c.scrollWidth; };
+
+const tick = b => {
+  const c = $(b === ghost ? '#ghost' : '#c' + b.index);
+  if (c) fill(c, b);
+  $('#live').textContent = `Mining block #${b.index} | nonce ${b.nonce.toLocaleString()} | target ${'0'.repeat(b.difficulty)}…`;
+};
+
+// ---------- Actions ----------
+async function init() {
+  chain = []; ghost = null; $('#log').textContent = '';
+  const g = newBlock('Genesis Block');
+  lock(true);
+  await mine(g, +$('#diff').value);
+  chain.push(g); lock(false); render();
+  log('New chain started. Type some data and press Mine Block, then try editing a block.');
+}
+
+async function addBlock() {
+  if (busy) return;
+  const d = +$('#diff').value, data = $('#data').value.trim() || 'Transaction #' + chain.length;
+  const b = newBlock(data); ghost = b;
+  lock(true); render(); scrollEnd();
+  log(`Mining block #${b.index} at difficulty ${d}...`);
+  await mine(b, d, tick);
+  chain.push(b); ghost = null; $('#live').textContent = '';
+  lock(false); $('#data').value = ''; render(); scrollEnd();
+  log(`Mined block #${b.index} in ${b.ms} ms after ${(b.nonce + 1).toLocaleString()} attempts. Hash: ${b.hash.slice(0, 20)}…`);
+}
+
+async function remine(i) {
+  const d = +$('#diff').value; let ms = 0;
+  lock(true);
+  log(`Re-mining ${chain.length - i} block(s) from #${i}...`);
+  for (let j = i; j < chain.length; j++) {
+    if (j) chain[j].prev = chain[j - 1].hash;
+    await mine(chain[j], d, tick); ms += chain[j].ms; paint();
+  }
+  lock(false); $('#live').textContent = '';
+  log(`Done in ${ms} ms. ${$('#state').textContent}`);
+}
+
+// Card buttons (attacks and repair)
+$('#chain').addEventListener('click', e => {
+  const t = e.target.closest('button');
+  if (!t || busy) return;
+  const i = +t.closest('.card').dataset.i, a = t.dataset.a, b = chain[i];
+  if (a === 'remine') return remine(i);
+  if (a === 'rehash') { b.hash = hashOf(b); log(`ATTACK: recomputed hash of block #${i} without mining.`); }
+  if (a === 'fake') { b.hash = 'f'.repeat(64); log(`ATTACK: replaced hash of block #${i} with a fake value.`); }
+  if (a === 'link') { b.prev = 'a'.repeat(64); log(`ATTACK: changed previous-hash link of block #${i}.`); }
+  paint(); log('   -> ' + $('#state').textContent);
+});
+
+// Editing a block's data = the "change data only" attack
+$('#chain').addEventListener('input', e => {
+  if (e.target.tagName !== 'TEXTAREA') return;
+  const i = +e.target.closest('.card').dataset.i;
+  chain[i].data = e.target.value; paint();
+});
+
+$('#mine').onclick = addBlock;
+$('#data').onkeydown = e => { if (e.key === 'Enter') addBlock(); };
+$('#validate').onclick = () => { paint(); log('Validate: ' + $('#state').textContent); };
+$('#reset').onclick = init;
+$('#diff').onchange = () => log(`Difficulty ${$('#diff').value}: new blocks need a hash starting with ${'0'.repeat(+$('#diff').value)}.`);
+
+init();
+</script>
+</body>
+</html>
